@@ -123,7 +123,4 @@ flowchart TD
 
 Điểm quan trọng: đây vẫn là một ReAct Agent, không phải hệ thống multi-agent. Các file `bonus_*.py` đóng vai trò module hỗ trợ logic Python, không tự gọi LLM.
 
-Tôi đã thay đổi 1 số file kèm thêm mới một số file khác để hoàn thành luồng xử lý trên:
-- Thay đổi trong file agent.py:
-    - Thay đổi system_prompt để phù hợp với đa dịch vụ thay vì chỉ Github và Cloudfare. Đồng thời thiết lập chỉ dẫn chi tiết hơn.
-    - Thêm 
+

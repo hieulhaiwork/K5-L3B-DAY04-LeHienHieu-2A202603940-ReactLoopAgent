@@ -1,383 +1,137 @@
-
-"""Stage 5: provenance ledger and bounded, non-LLM evidence checks."""
+"""One source of truth for evidence, completeness checks, and final-answer validation."""
 from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Any
 
-from bonus_retry import is_failure, error_code
+from bonus_policy import failed
 
-
-URL_PATTERN = re.compile(r"https?://[^\s<>\]\)\}\"']+")
-
-CONFIDENT_HEALTH = re.compile(
-    r"(?i)((?:đang\s+)?hoạt\s+động\s+bình\s+thường|hoạt\s+động\s+ổn\s+định|"
-    r"không\s+(có|gặp)\s+sự\s+cố|all\s+systems\s+operational|"
-    r"\bis\s+operational\b|\bfully\s+operational\b)"
-)
-
-UNCERTAINTY = re.compile(
-    r"(?i)(không\s+(thể|đủ|có)\s+(xác\s+nhận|kết\s+luận|dữ\s+liệu|bằng\s+chứng)|"
-    r"chưa\s+(thể|xác\s+minh|đủ)|không\s+khẳng\s+định|"
-    r"không\s+thể\s+biết|unable\s+to\s+verify|cannot\s+confirm|"
-    r"not\s+verified|unknown|thiếu\s+dữ\s+liệu)"
-)
+URL = re.compile(r"https?://[^\s<>\]\)\}\"']+")
+HEALTHY = re.compile(r"hoạt\s+động\s+(?:bình\s+thường|ổn\s+định)|all\s+systems\s+operational|fully\s+operational|\bis\s+operational\b", re.I)
+UNKNOWN = re.compile(r"không\s+(?:thể\s+)?(?:xác\s+minh|xác\s+nhận|khẳng\s+định)|chưa\s+(?:thể\s+)?xác\s+minh|unknown|unable\s+to\s+verify|cannot\s+confirm|rate_limited", re.I)
+ALL_HEALTHY = re.compile(r"all\s+(?:providers|services)\s+(?:are\s+)?(?:fully\s+)?operational|tất\s+cả\s+(?:các\s+)?(?:nhà\s+cung\s+cấp|dịch\s+vụ)\s+(?:đều\s+)?(?:đang\s+)?hoạt\s+động\s+bình\s+thường", re.I)
+NEEDS_SCOPE = re.compile(r"phạm\s+vi|ảnh\s+hưởng|tác\s+động|\bscope\b|\bimpact\b|đối\s+chiếu|so\s+sánh", re.I)
+MENTIONS_INCIDENT = re.compile(r"\bincidents?\b|sự\s+cố", re.I)
+FULL_TIMELINE = re.compile(r"đã\s+xem\s+(?:hết|toàn\s+bộ)|entire\s+timeline|all\s+updates\s+reviewed", re.I)
 
 
-def provider_of(
-    tool_name: str,
-    args: dict,
-    result: Any,
-) -> str | None:
-
-    if isinstance(result, dict) and isinstance(
-        result.get("provider"), str
-    ):
-        return result["provider"].casefold()
-
+def provider_for(name, args, data):
+    if isinstance(data, dict) and isinstance(data.get("provider"), str):
+        return data["provider"].casefold()
     if isinstance(args.get("provider"), str):
         return args["provider"].casefold()
-
-    m = re.fullmatch(r"get_(.+)_status", tool_name)
-
-    if m:
-        return m.group(1).casefold()
-
-    return None
+    match = re.fullmatch(r"get_(.+)_status", name)
+    return match.group(1).casefold() if match else None
 
 
-class EvidenceLedger:
+class Evidence:
     def __init__(self):
-        self.incident_urls: dict[str, set[str]] = defaultdict(set)
-        self.status_urls: dict[str, set[str]] = defaultdict(set)
-        self.successful_status: set[str] = set()
-        self.failed_status: dict[str, set[str]] = defaultdict(set)
-        self.captured_at: dict[str, set[str]] = defaultdict(set)
-        self.incomplete_timelines: set[tuple[str, str]] = set()
-        self.tool_failures: list[tuple[str, str]] = []
-        self.other_observed_urls: set[str] = set()
+        self.status = {}                # provider -> successful status snapshot
+        self.failures = defaultdict(set)  # provider -> error codes; cleared on success
+        self.incident_urls = defaultdict(set)
+        self.details = set()            # (provider, incident_id) fetched successfully
+        self.incomplete = set()         # (provider, incident_id) with a next page
+        self.rate_limited_once = set()  # for possible answer audit
 
-    def record(
-        self,
-        tool_name: str,
-        args: dict,
-        result: Any,
-    ) -> None:
-
-        provider = provider_of(tool_name, args, result)
-
+    def record(self, name, args, result):
+        provider = provider_for(name, args, result)
         if not provider or not isinstance(result, dict):
             return
-
-        if result.get("captured_at"):
-            self.captured_at[provider].add(
-                str(result["captured_at"])
-            )
-
-        # Also remember links mentioned in incident update bodies.
-        if not is_failure(result):
-            for update in result.get("updates") or []:
-                if (
-                    isinstance(update, dict)
-                    and isinstance(update.get("body"), str)
-                ):
-                    self.other_observed_urls.update(
-                        m.group(0).rstrip(".,;:")
-                        for m in URL_PATTERN.finditer(update["body"])
-                    )
-
-        if tool_name == "get_incident_details":
-            if not is_failure(result) and result.get("url"):
-                self.incident_urls[provider].add(str(result["url"]))
-
-            if not is_failure(result):
-                incident_id = str(
-                    result.get("id")
-                    or args.get("incident_id")
-                    or ""
-                )
-
-                key = (provider, incident_id)
-
-                if result.get("next_offset") is not None:
-                    self.incomplete_timelines.add(key)
-                else:
-                    self.incomplete_timelines.discard(key)
-
-            return
-
-        if (
-            tool_name == "get_status"
-            or (
-                tool_name.startswith("get_")
-                and tool_name.endswith("_status")
-            )
-        ):
-            if is_failure(result):
-                code = error_code(result) or "UNKNOWN_ERROR"
-
-                self.failed_status[provider].add(code)
-                self.tool_failures.append((provider, code))
-
+        is_status = name == "get_status" or (name.startswith("get_") and name.endswith("_status"))
+        if is_status:
+            if failed(result):
+                code = str(result.get("error") or "UNKNOWN_ERROR")
+                self.failures[provider].add(code)
+                if code.upper() == "RATE_LIMITED":
+                    self.rate_limited_once.add(provider)
             else:
-                self.successful_status.add(provider)
-                self.failed_status.pop(provider, None)
+                self.status[provider] = result
+                self.failures.pop(provider, None)
+        elif name == "get_incident_details" and not failed(result):
+            key = (provider, str(result.get("id") or args.get("incident_id") or ""))
+            self.details.add(key)
+            if result.get("url"):
+                self.incident_urls[provider].add(str(result["url"]))
+            if result.get("next_offset") is None:
+                self.incomplete.discard(key)
+            else:
+                self.incomplete.add(key)
 
-                if isinstance(result.get("source"), str):
-                    self.status_urls[provider].add(result["source"])
+    @staticmethod
+    def requires_scope(question):
+        return bool(MENTIONS_INCIDENT.search(question) and NEEDS_SCOPE.search(question))
 
-    def missing_providers(self, answer: str) -> list[str]:
-        return sorted(
-            provider
-            for provider, urls in self.incident_urls.items()
-            if urls and not any(url in answer for url in urls)
-        )
-
-    def _unsupported_url(self, answer: str) -> list[str]:
-        known = {
-            u
-            for values in self.incident_urls.values()
-            for u in values
-        }
-
-        known.update(
-            u
-            for values in self.status_urls.values()
-            for u in values
-        )
-
-        found = {
-            match.group(0).rstrip(".,;:")
-            for match in URL_PATTERN.finditer(answer)
-        }
-
-        incident_links = [
-            url
-            for url in found
-            if (
-                "/incidents/" in url
-                or "stspg.io/" in url
-            )
-            and url not in known
-        ]
-
-        return sorted(incident_links)
-
-    def unsupported_health_claim(self, answer: str) -> list[str]:
-        """Detect unsupported operational claims for providers with failed status checks."""
-
-        # Chỉ xét provider chưa có lần kiểm tra thành công.
-        failed = {
-            provider.casefold()
-            for provider in self.failed_status
-            if provider not in self.successful_status
-        }
-
-        if not failed:
+    def missing_details(self, question):
+        """Only enforce details for explicitly requested incident scope comparisons."""
+        if not self.requires_scope(question):
             return []
+        q = question.casefold()
+        missing = []
+        for provider, result in self.status.items():
+            if provider not in q:
+                continue
+            incidents = [x for x in result.get("incidents", []) if isinstance(x, dict) and x.get("id")]
+            if not incidents:
+                continue
+            incident = next((x for x in incidents if str(x["id"]) in q), incidents[0])
+            key = (provider, str(incident["id"]))
+            if key not in self.details:
+                missing.append((provider, *key[1:], incident.get("name", "")))
+        return missing
 
-        errors = set()
-
-        # 1. Phát hiện kết luận về TẤT CẢ providers.
-        global_pattern = re.compile(
-            r"(?i)("
-            r"all\s+(?:services|providers)\s+"
-            r"(?:are\s+)?(?:fully\s+)?operational|"
-            r"tất\s+cả\s+(?:các\s+)?"
-            r"(?:dịch\s+vụ|nhà\s+cung\s+cấp)\s+"
-            r"(?:đều\s+)?(?:đang\s+)?"
-            r"hoạt\s+động\s+bình\s+thường"
-            r")"
-        )
-
-        # 2. Tách nội dung theo provider
-        providers = sorted(
-            set(self.failed_status) | self.successful_status,
-            key=len,
-            reverse=True,
-        )
-
-        provider_pattern = re.compile(
-            r"(?<!\w)(?:"
-            + "|".join(re.escape(p) for p in providers)
-            + r")(?!\w)",
-            re.IGNORECASE,
-        )
-
-        for line in answer.splitlines():
-
-            # Kiểm tra khẳng định tất cả providers đều khỏe.
-            if (
-                global_pattern.search(line)
-                and not UNCERTAINTY.search(line)
-                and not re.search(
-                    r"(?i)không\s+thể\s+khẳng\s+định",
-                    line,
-                )
-            ):
-                errors.add("global_status_without_full_evidence")
-
-            # Kiểm tra khẳng định trạng thái của từng provider.
-            matches = list(provider_pattern.finditer(line))
-
-            for i, match in enumerate(matches):
-                provider = match.group().casefold()
-
-                if provider not in failed:
-                    continue
-
-                # Chỉ lấy nội dung thuộc về provider này.
-                end = (
-                    matches[i + 1].start()
-                    if i + 1 < len(matches)
-                    else len(line)
-                )
-                text = line[match.end():end]
-
-                # Kiểm tra khẳng định operational.
-                claims_healthy = (
-                    CONFIDENT_HEALTH.search(text)
-                    or re.search(r"(?i)\b(?:operational|healthy)\b", text)
-                )
-
-                expresses_uncertainty = (
-                    UNCERTAINTY.search(text)
-                    or re.search(
-                        r"(?i)(not\s+(?:fully\s+)?operational|"
-                        r"không\s+(?:thể\s+)?(?:xác\s+minh|"
-                        r"xác\s+nhận|khẳng\s+định|hoạt\s+động))",
-                        text,
-                    )
-                )
-
-                if claims_healthy and not expresses_uncertainty:
-                    errors.add(provider)
-
-        return sorted(errors)
-
-    def validate(
-        self,
-        answer: str,
-        *,
-        advanced: bool = True,
-        question: str = "",
-    ) -> list[str]:
-        """
-        Kiểm tra final answer dựa trên evidence đã thu thập.
-
-        Returns:
-            []: Câu trả lời vượt qua các kiểm tra.
-            list[str]: Những lỗi cần yêu cầu LLM sửa.
-        """
+    def validate(self, answer, question="", advanced=True):
         errors = []
-        answer_lower = answer.casefold()
-        question_lower = question.casefold()
-
-        # 1. Kiểm tra URL của incident đã điều tra
-        # Ít nhất một URL hợp lệ cho mỗi provider có incident details.
-        missing = self.missing_providers(answer)
-
-        if missing:
-            sources = "; ".join(
-                f"{provider}: "
-                + ", ".join(sorted(self.incident_urls[provider]))
-                for provider in missing
-            )
-            errors.append(
-                f"Thiếu URL incident đã xác minh cho provider: {sources}"
-            )
-
-        # Chỉ kiểm tra nguồn cơ bản nếu không bật advanced.
+        lower_answer = answer.casefold()
+        # For the original lab contract, one confirmed incident URL per provider is sufficient.
+        for provider, urls in self.incident_urls.items():
+            if urls and not any(url in answer for url in urls):
+                errors.append(f"Thiếu URL incident {provider}: {', '.join(sorted(urls))}")
         if not advanced:
             return errors
 
-        # 2. Kiểm tra provider bị lỗi nhưng không được đề cập
-        for provider in sorted(self.failed_status):
-            if provider in self.successful_status:
-                continue
-
-            if provider.casefold() not in answer_lower:
-                errors.append(
-                    f"Chưa báo trạng thái chưa xác minh được "
-                    f"của {provider} do tool lỗi."
-                )
-
-        # 3. Phát hiện kết luận operational thiếu bằng chứng
-        for provider in self.unsupported_health_claim(answer):
-            if provider == "global_status_without_full_evidence":
-                errors.append(
-                    "Không thể khẳng định tất cả dịch vụ hoạt động "
-                    "bình thường khi có provider bị lỗi."
-                )
-            else:
-                errors.append(
-                    f"Provider {provider} bị lỗi tool; "
-                    "không được khẳng định operational."
-                )
-
-        # 4. Kiểm tra URL nguồn
-        # 4a. Phát hiện URL incident không được xác minh.
-        unverified_links = self._unsupported_url(answer)
-
-        if unverified_links:
-            errors.append(
-                "URL incident chưa được tools xác nhận: "
-                + ", ".join(unverified_links)
-            )
-
-        # 4b. Nếu người dùng yêu cầu nguồn, kiểm tra từng provider.
-        source_requested = any(
-            keyword in question_lower
-            for keyword in ("nguồn", "dẫn link", "source", "cite", "url")
-        )
-
+        source_requested = any(x in question.casefold() for x in ("nguồn", "dẫn link", "source", "cite", "url"))
         if source_requested:
-            for provider, urls in sorted(self.status_urls.items()):
-                # Chấp nhận cả URL status hoặc incident hợp lệ
-                # thuộc cùng provider.
-                allowed_urls = (
-                    urls | self.incident_urls.get(provider, set())
-                )
+            for provider, data in self.status.items():
+                urls = set(self.incident_urls.get(provider, set()))
+                if isinstance(data.get("source"), str):
+                    urls.add(data["source"])
+                if urls and not any(u in answer for u in urls):
+                    errors.append(f"Thiếu nguồn {provider}: {', '.join(sorted(urls))}")
 
-                if allowed_urls and not any(
-                    url in answer for url in allowed_urls
-                ):
-                    errors.append(
-                        f"Thiếu URL nguồn cho {provider}: "
-                        + ", ".join(sorted(allowed_urls))
-                    )
+        known_links = {u for links in self.incident_urls.values() for u in links}
+        known_links |= {d.get("source") for d in self.status.values() if isinstance(d.get("source"), str)}
+        for url in {x.group(0).rstrip(".,;:") for x in URL.finditer(answer)}:
+            if ("/incidents/" in url or "stspg.io/" in url) and url not in known_links:
+                errors.append(f"URL incident chưa được xác minh: {url}")
 
-        # 5. Kiểm tra tuyên bố đã đọc toàn bộ timeline
-        claims_full_timeline = re.search(
-            r"(?i)(đã\s+xem\s+(hết|toàn\s+bộ)|"
-            r"toàn\s+bộ\s+timeline\s+đã|"
-            r"all\s+updates\s+reviewed|"
-            r"entire\s+timeline)",
-            answer,
-        )
+        for provider in sorted(self.failures):
+            if provider not in lower_answer:
+                errors.append(f"Chưa báo trạng thái {provider} chưa xác minh do tool lỗi")
+                continue
+            for line in answer.splitlines():
+                # Check only a local provider claim; don't mistake GitHub's
+                # 'All Systems Operational' for a global claim about Vercel.
+                if provider in line.casefold() and HEALTHY.search(line) and not UNKNOWN.search(line):
+                    errors.append(f"Không có bằng chứng {provider} operational")
+                    break
 
-        if self.incomplete_timelines and claims_full_timeline:
-            errors.append(
-                "Timeline chưa đọc hết; "
-                "không được khẳng định đã xem mọi update."
-            )
-
+        if self.failures and any(ALL_HEALTHY.search(line) and not UNKNOWN.search(line)
+                                 for line in answer.splitlines()):
+            errors.append("Không đủ bằng chứng rằng tất cả nhà cung cấp đều operational")
+        if self.incomplete and FULL_TIMELINE.search(answer):
+            errors.append("Không khẳng định đã xem hết timeline khi còn next_offset")
         return errors
 
-    def partial_failure_note(self) -> str:
-        parts = []
-
-        for provider, errors in sorted(self.failed_status.items()):
-            if provider not in self.successful_status:
-                parts.append(
-                    f"{provider}: chưa xác minh được trạng thái "
-                    f"({', '.join(sorted(errors))})"
-                )
-
-        for provider, incident_id in sorted(self.incomplete_timelines):
-            parts.append(
-                f"{provider}/{incident_id}: timeline chưa được đọc hết"
-            )
-
-        return "; ".join(parts)
+    def summary(self):
+        """Conservative fallback for basic status requests, not incident investigations."""
+        lines = ["Theo các snapshot đã thu thập (không phải trạng thái live):"]
+        for name, data in self.status.items():
+            overall = data.get("overall") or {}
+            lines.append(f"- {name}: {overall.get('description') or overall.get('indicator') or 'unknown'}; "
+                         f"captured_at={data.get('captured_at', 'unknown')}; "
+                         f"nguồn={data.get('source', 'không có nguồn')}.")
+        for name, problems in sorted(self.failures.items()):
+            lines.append(f"- {name}: chưa thể xác minh ({', '.join(sorted(problems))}); "
+                         "lỗi tool không chứng minh outage.")
+        lines.append("Không đủ căn cứ suy ra nguyên nhân chung giữa các nhà cung cấp.")
+        return "\n".join(lines)
