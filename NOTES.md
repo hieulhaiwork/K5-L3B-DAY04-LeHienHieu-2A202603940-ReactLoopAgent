@@ -100,3 +100,30 @@ Nêu giới hạn của điểm judge, của snapshot và của việc chỉ ch�
 - Giới hạn của điểm judge: Điểm số được chấm bởi mô hình gpt-4o-mini, nên nó mang tính chủ quan và có thể bị thiên lệch. Đôi khi Judge trừ điểm vì cách trình bày không hợp ý nó (như ở case A1) chứ không hẳn là do logic code của Agent bị sai.
 - Dữ liệu được cấp cho công cụ chỉ là một snapshot tĩnh giới hạn ở 50 incident gần nhất. Do đó, agent không thể xác nhận tính chính xác của các sự cố nằm ngoài phạm vi 50 mục này, dẫn đến các câu trả lời mang tính cục bộ.
 - Một lần chạy đánh giá (eval_after.json) không đủ để khẳng định độ ổn định của hệ thống. LLM có tính ngẫu nhiên, nên cùng một câu hỏi và cùng một file code, số lượng tool calls hoặc câu trả lời sinh ra có thể khác biệt ở những lần chạy sau.
+
+## 6. Bonus
+Luồng xử lý tổng quát:
+
+```mermaid
+flowchart TD
+    A["User Question"] --> B["agent.py: ReAct Loop"]
+    B --> C["LLM Provider"]
+    C --> D{"Tool calls?"}
+    D -->|Yes| E["bonus_retry.py"]
+    E --> F["Status Tools"]
+    F --> G["bonus_pagination.py"]
+    G --> H["bonus_evidence.py: Record"]
+    H --> I["bonus_context.py: Filter"]
+    I --> C
+    D -->|Final answer| J["bonus_evidence.py: Validate"]
+    J -->|Pass| K["Completed"]
+    J -->|Needs revision| C
+    J -->|Budget exhausted| L["max_steps"]
+```
+
+Điểm quan trọng: đây vẫn là một ReAct Agent, không phải hệ thống multi-agent. Các file `bonus_*.py` đóng vai trò module hỗ trợ logic Python, không tự gọi LLM.
+
+Tôi đã thay đổi 1 số file kèm thêm mới một số file khác để hoàn thành luồng xử lý trên:
+- Thay đổi trong file agent.py:
+    - Thay đổi system_prompt để phù hợp với đa dịch vụ thay vì chỉ Github và Cloudfare. Đồng thời thiết lập chỉ dẫn chi tiết hơn.
+    - Thêm 
